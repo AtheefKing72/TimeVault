@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TimeVault - Discover Your Next Timepiece</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Use Inter font -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f4f7f9;
+        }
+        .product-card {
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+        .product-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
+        }
+        .btn-primary {
+            background-color: #1a56db;
+            transition: background-color 0.2s;
+        }
+        .btn-primary:hover {
+            background-color: #0d46a8;
+        }
+        .cart-open {
+            visibility: visible;
+            opacity: 1;
+        }
+    </style>
+</head>
+<body>
+
+<!-- Firebase & Global Variable Setup -->
+<script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, doc, setDoc, onSnapshot, collection, getDoc, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+    // IMPORTANT: Canvas provided global variables MUST be used
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+    const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+    const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+    // Firebase Initialization
+    let app, db, auth;
+    let userId = null;
+    let isAuthReady = false;
+    
+    // Firestore Collection Names
+    const CART_COLLECTION_NAME = 'watches_cart';
+    const PRODUCTS_COLLECTION_NAME = 'store_products'; // New public collection name
+
+    // App State
+    window.cart = {}; // { productId: { ...product, quantity: N } }
+    window.products = []; // Array to hold products loaded from Firestore
+
+    // Utility Functions
+    window.formatPrice = (price) => `$${price.toFixed(2)}`;
+    
+    // Firestore Path References
+    // Private data for Cart: /artifacts/{appId}/users/{userId}/{collectionName}
+    const getCartDocRef = (uid) => doc(db, 'artifacts', appId, 'users', uid, CART_COLLECTION_NAME, 'current_cart');
+    // Public data for Products: /artifacts/{appId}/public/data/{collectionName}
+    const getProductsCollectionRef = () => collection(db, 'artifacts', appId, 'public', 'data', PRODUCTS_COLLECTION_NAME);
+
+    // --- Product Management Logic ---
+    
+    // Render the dynamic product grid
+    const renderProducts = () => {
+        const gridContainer = document.getElementById('product-grid');
+        gridContainer.innerHTML = ''; // Clear previous products
+
+        if (window.products.length === 0) {
+            gridContainer.innerHTML = '<p class="text-center text-gray-500 text-lg col-span-full py-10">No products are currently available in the vault. Please use the product manager to add items.</p>';
+            return;
+        }
+        
+        window.products.forEach(product => {
+            // Ensure product link is valid before embedding
+            const productLink = product.link || '#'; 
+            
+            gridContainer.innerHTML += `
+                <div class="product-card bg-white rounded-xl shadow-lg overflow-hidden border border-gray-200">
+                    <img src="${product.img}" onerror="this.src='https://placehold.co/600x400?text=Image+Not+Found'" alt="${product.name}" class="w-full h-48 object-cover">
+                    <div class="p-5">
+                        <h3 class="text-xl font-semibold text-gray-900 mb-2">${product.name}</h3>
+                        <p class="text-sm text-gray-500 mb-3">${product.description}</p>
+                        <div class="flex flex-col space-y-2">
+                            <div class="flex justify-between items-center">
+                                <span class="text-2xl font-bold text-red-600">${window.formatPrice(product.price)}</span>
+                                <button onclick="window.addToCart('${product.id}')" class="btn-primary text-white font-medium py-2 px-4 rounded-full shadow-md">
+                                    Add to Cart
+                                </button>
+                            </div>
+                            <!-- AliExpress Link -->
+                            <a href="${productLink}" target="_blank" class="text-center bg-gray-200 text-gray-800 font-medium py-2 px-4 rounded-full shadow-sm hover:bg-gray-300 transition block text-sm">
+                                View on AliExpress
+                            </a>
+                        </div>
+                    </div>
+                </div>
+            `;
+        });
+    };
+
+    // Load Products from Firestore (public collection)
+    const loadAndListenToProducts = () => {
+        if (!db) return; // Wait for Firebase to initialize
+        
+        onSnapshot(getProductsCollectionRef(), (snapshot) => {
+            window.products = [];
+            snapshot.forEach(doc => {
+                const data = doc.data();
+                // Ensure price is treated as a number
+                data.price = parseFloat(data.price);
+                window.products.push(data);
+            });
+            // Sort products by their timestamp if available, otherwise keep default order
+            window.products.sort((a, b) => (b.timestamp?.toDate()?.getTime() || 0) - (a.timestamp?.toDate()?.getTime() || 0));
+            
+            renderProducts();
+            console.log("Store products dynamically loaded.");
+        }, (error) => {
+            console.error("Error listening to products collection:", error);
+            showNotification('Error: Could not load store products.', 'bg-red-500');
+        });
+    };
+    
+    // --- Cart Management Logic ---
+
+    // Save Cart to Firestore
+    const saveCart = async () => {
+        if (!db || !userId) return;
+        try {
+            // Only store essential cart item details
+            const cartData = Object.values(window.cart).map(item => ({
+                id: item.id,
+                name: item.name,
+                price: item.price,
+                img: item.img,
+                quantity: item.quantity
+            }));
+            
+            await setDoc(getCartDocRef(userId), { items: cartData, lastUpdated: new Date() });
+            console.log("Cart saved successfully to Firestore.");
+        } catch (error) {
+            console.error("Error saving cart to Firestore:", error);
+            showNotification('Error: Failed to save cart!', 'bg-red-500');
+        }
+    };
+    
+    // Load Cart from Firestore and set up real-time listener
+    const loadAndListenToCart = () => {
+        if (!db || !userId) return;
+        
+        const docRef = getCartDocRef(userId);
+        
+        onSnapshot(docRef, (docSnap) => {
+            if (docSnap.exists() && docSnap.data().items) {
+                const fetchedItems = docSnap.data().items;
+                const newCart = {};
+                fetchedItems.forEach(item => {
+                    newCart[item.id] = item;
+                });
+                window.cart = newCart;
+                window.renderCart();
+                console.log("Cart updated from Firestore via onSnapshot.");
+            } else {
+                window.cart = {};
+                window.renderCart();
+                console.log("No existing cart found or cart is empty.");
+            }
+        }, (error) => {
+            console.error("Error listening to cart:", error);
+            showNotification('Error: Could not sync cart data.', 'bg-red-500');
+        });
+    };
+
+    // Notification/Toast Function
+    const showNotification = (message, colorClass = 'bg-green-500') => {
+        const notificationEl = document.getElementById('notification');
+        notificationEl.textContent = message;
+        notificationEl.className = `fixed bottom-4 right-4 p-3 rounded-lg shadow-xl text-white ${colorClass} transition-opacity duration-300 z-50`;
+        notificationEl.style.opacity = '1';
+        setTimeout(() => {
+            notificationEl.style.opacity = '0';
+        }, 3000);
+    };
+    window.showNotification = showNotification;
+
+    // Initialize App and Auth
+    const initApp = async () => {
+        try {
+            setLogLevel('debug');
+
+            if (Object.keys(firebaseConfig).length === 0) {
+                 console.error("Firebase config is empty. Cannot initialize Firebase.");
+                 document.getElementById('auth-status').textContent = 'Error: Firebase not configured.';
+                 return;
+            }
+
+            app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+            
+            // Handle authentication state
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    userId = user.uid;
+                } else if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                    userId = auth.currentUser.uid;
+                } else {
+                    await signInAnonymously(auth);
+                    userId = auth.currentUser.uid;
+                }
+                
+                isAuthReady = true;
+                document.getElementById('auth-status').textContent = `User ID: ${userId}`;
+                
+                // Start listening for product updates (now called AFTER anonymous sign-in is complete)
+                loadAndListenToProducts(); 
+
+                // Start listening for cart updates
+                loadAndListenToCart();
+            });
+            
+            // Removed: loadAndListenToProducts() call from here to prevent race condition before auth is ready
+
+        } catch (error) {
+            console.error("Firebase/Authentication initialization failed:", error);
+            document.getElementById('auth-status').textContent = 'Error: Auth failed. Check console.';
+        }
+    };
+    
+    window.addEventListener('load', initApp);
+
+    // E-commerce Logic (Modified to fetch product details from window.products)
+    window.addToCart = (productId) => {
+        if (!isAuthReady || !userId) {
+            showNotification('Authentication in progress. Please wait a moment.', 'bg-yellow-500');
+            return;
+        }
+        
+        const product = window.products.find(p => p.id === productId);
+        if (!product) {
+            showNotification('Product not found in inventory!', 'bg-red-500');
+            return;
+        }
+
+        const { id, name, price, img } = product;
+        if (window.cart[id]) {
+            window.cart[id].quantity += 1;
+        } else {
+            // Only store necessary data in the cart document
+            window.cart[id] = { id, name, price, img, quantity: 1 };
+        }
+        
+        saveCart();
+        showNotification(`${name} added to cart!`, 'bg-indigo-600');
+    };
+
+    window.removeItem = (id) => {
+        if (!isAuthReady || !userId) return;
+        
+        if (window.cart[id]) {
+            delete window.cart[id];
+            saveCart();
+            showNotification(`Item removed from cart.`, 'bg-red-600');
+        }
+    };
+
+    window.updateQuantity = (id, change) => {
+        if (!isAuthReady || !userId) return;
+
+        const item = window.cart[id];
+        if (item) {
+            item.quantity += change;
+            if (item.quantity <= 0) {
+                window.removeItem(id); // Use removeItem to handle saveCart implicitly
+            } else {
+                saveCart();
+            }
+        }
+    };
+
+    window.renderCart = () => {
+        const cartItemsContainer = document.getElementById('cart-items-container');
+        const cartTotalEl = document.getElementById('cart-total');
+        const cartCountEl = document.getElementById('cart-count');
+        const checkoutButton = document.getElementById('checkout-btn');
+        
+        cartItemsContainer.innerHTML = '';
+        let total = 0;
+        let itemCount = 0;
+
+        const itemsArray = Object.values(window.cart);
+
+        if (itemsArray.length === 0) {
+            cartItemsContainer.innerHTML = '<p class="text-gray-500 text-center py-8">Your vault is empty. Add some timepieces!</p>';
+            checkoutButton.disabled = true;
+            checkoutButton.classList.add('opacity-50', 'cursor-not-allowed');
+        } else {
+            checkoutButton.disabled = false;
+            checkoutButton.classList.remove('opacity-50', 'cursor-not-allowed');
+
+            itemsArray.forEach(item => {
+                const itemTotal = item.price * item.quantity;
+                total += itemTotal;
+                itemCount += item.quantity;
+
+                cartItemsContainer.innerHTML += `
+                    <div class="flex items-center justify-between border-b border-gray-100 py-3">
+                        <div class="flex items-center space-x-3">
+                            <img src="${item.img}" alt="${item.name}" class="w-12 h-12 object-cover rounded">
+                            <div>
+                                <h4 class="text-sm font-semibold">${item.name}</h4>
+                                <p class="text-xs text-gray-500">${window.formatPrice(item.price)} each</p>
+                            </div>
+                        </div>
+                        <div class="flex items-center space-x-2">
+                            <button onclick="window.updateQuantity('${item.id}', -1)" class="text-gray-600 hover:text-red-500 p-1 rounded-full border">-</button>
+                            <span class="text-sm w-5 text-center">${item.quantity}</span>
+                            <button onclick="window.updateQuantity('${item.id}', 1)" class="text-gray-600 hover:text-green-500 p-1 rounded-full border">+</button>
+                            <button onclick="window.removeItem('${item.id}')" class="text-red-500 hover:text-red-700 ml-2">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                                </svg>
+                            </button>
+                        </div>
+                        <p class="text-sm font-semibold">${window.formatPrice(itemTotal)}</p>
+                    </div>
+                `;
+            });
+        }
+
+        cartTotalEl.textContent = window.formatPrice(total);
+        cartCountEl.textContent = itemCount;
+    };
+
+    window.toggleCart = () => {
+        const cartModal = document.getElementById('cart-modal');
+        cartModal.classList.toggle('cart-open');
+    };
+
+    window.mockCheckout = () => {
+        if (Object.keys(window.cart).length === 0) {
+            showNotification('Your cart is empty!', 'bg-yellow-500');
+            return;
+        }
+
+        showNotification('Order Placed! (Mock Checkout). Thank you for shopping with TimeVault!', 'bg-green-600');
+        
+        // Clear the cart locally and in Firestore after mock checkout
+        window.cart = {};
+        saveCart();
+        window.renderCart();
+        window.toggleCart();
+    };
+
+</script>
+
+<!-- Header & Navigation -->
+<header class="bg-white shadow-md sticky top-0 z-40">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
+        <!-- Logo/Brand -->
+        <a href="#" class="text-3xl font-extrabold text-[#1a56db] flex items-center">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 mr-2 text-gray-800" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            TimeVault
+        </a>
+
+        <!-- Cart Button -->
+        <button onclick="window.toggleCart()" class="relative p-2 rounded-full bg-gray-100 hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M16 11V7a4 4 0 00-8 0v4M5 9h14l1 12H4L5 9z" />
+            </svg>
+            <span id="cart-count" class="absolute top-0 right-0 inline-flex items-center justify-center px-2 py-1 text-xs font-bold leading-none text-red-100 transform translate-x-1/2 -translate-y-1/2 bg-red-600 rounded-full">0</span>
+        </button>
+    </div>
+</header>
+<!-- Main Content: Product Grid -->
+<main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
+    <h1 class="text-4xl font-bold text-gray-800 mb-8 text-center">Curated Timepieces. Unbeatable Value.</h1>
+    <p id="auth-status" class="text-sm text-center text-gray-500 mb-8">Initializing Authentication...</p>
+
+    <div id="product-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-8">
+        <!-- Products are now loaded dynamically from Firestore! -->
+        <p class="text-center text-gray-500 text-lg col-span-full py-10">Loading products...</p>
+    </div>
+</main>
+
+<!-- Cart Modal (Off-Canvas Sidebar) -->
+<div id="cart-modal" class="fixed inset-0 bg-black bg-opacity-50 z-50 transition-opacity duration-300 invisible opacity-0 flex justify-end" onclick="if (event.target.id === 'cart-modal') window.toggleCart()">
+    <div class="bg-white w-full max-w-sm h-full shadow-2xl overflow-y-auto transform translate-x-full transition-transform duration-300" :class="{'translate-x-0': isOpen}">
+        <div class="flex justify-between items-center p-5 border-b border-gray-200 sticky top-0 bg-white z-10">
+            <h2 class="text-2xl font-bold text-gray-800">Your Shopping Vault</h2>
+            <button onclick="window.toggleCart()" class="text-gray-500 hover:text-gray-900 p-2 rounded-full hover:bg-gray-100">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+            </button>
+        </div>
+
+        <div id="cart-items-container" class="p-5 space-y-4">
+            <!-- Cart items will be rendered here by JavaScript -->
+        </div>
+
+        <div class="p-5 border-t border-gray-200 sticky bottom-0 bg-white z-10">
+            <div class="flex justify-between items-center mb-4">
+                <span class="text-lg font-semibold text-gray-700">Subtotal:</span>
+                <span id="cart-total" class="text-2xl font-extrabold text-[#1a56db]">$0.00</span>
+            </div>
+            <button id="checkout-btn" onclick="window.mockCheckout()" disabled class="w-full btn-primary text-white text-lg font-semibold py-3 rounded-full shadow-lg transition duration-150 ease-in-out opacity-50 cursor-not-allowed">
+                Proceed to Checkout
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- Notification/Toast Area -->
+<div id="notification" class="fixed bottom-4 right-4 p-3 rounded-lg shadow-xl text-white opacity-0 transition-opacity duration-300 z-50"></div>
+
+</body>
+</html>
